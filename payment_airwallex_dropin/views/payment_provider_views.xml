@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="payment_provider_form_airwallex" model="ir.ui.view">
+        <field name="name">payment.provider.form.airwallex</field>
+        <field name="model">payment.provider</field>
+        <field name="inherit_id" ref="payment.payment_provider_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//page[@name='credentials']" position="inside">
+                <group string="Airwallex API 設定" invisible="code != 'airwallex'">
+                    <field name="airwallex_client_id" required="code == 'airwallex'"/>
+                    <field name="airwallex_api_key" password="True" required="code == 'airwallex'"/>
+                </group>
+            </xpath>
+        </field>
+    </record>
+</odoo>

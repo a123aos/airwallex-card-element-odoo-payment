@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="payment_method_airwallex" model="payment.method">
+        <field name="name">Airwallex Card</field>
+        <field name="code">airwallex</field>
+        <field name="provider_ids" eval="[(6, 0, [ref('payment_provider_airwallex')])]"/>
+        <field name="active" eval="True"/>
+    </record>
+</odoo>

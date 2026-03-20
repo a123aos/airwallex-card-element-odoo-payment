@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="airwallex_inline_form">
+        <div class="o_airwallex_dropin_container" style="width: 100%; min-height: 300px;">
+            <div id="airwallex-dropin-element"></div>
+            <p class="text-muted mt-2">正在載入 Airwallex 安全付款組件...</p>
+        </div>
+    </template>
+</odoo>
