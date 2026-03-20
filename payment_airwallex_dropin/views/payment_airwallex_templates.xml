@@ -1,9 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
     <template id="airwallex_inline_form">
+        <script src="https://static.airwallex.com/sdk/sdk.js"></script>
+        
         <div class="o_airwallex_dropin_container" style="width: 100%; min-height: 300px;">
             <div id="airwallex-dropin-element"></div>
-            <p class="text-muted mt-2">正在載入 Airwallex 安全付款組件...</p>
+            
+            <div id="airwallex-loading" class="text-center p-3">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+                <p class="mt-2 text-muted">正在連接 Airwallex 安全付款服務...</p>
+            </div>
         </div>
     </template>
 </odoo>
