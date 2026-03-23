@@ -1,7 +1,8 @@
 /** @odoo-module **/
 
-import paymentForm from 'payment.payment_form';
-import { loadJS } from '@web/core/assets';
+import { PaymentForm } from "@payment/js/payment_form"; 
+import { patch } from "@web/core/utils/patch";
+import { loadJS } from "@web/core/assets";
 
 paymentForm.include({
     _airwallexInitialized: false,
