@@ -1,17 +1,33 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <record id="payment_provider_form_airwallex" model="ir.ui.view">
-        <field name="name">payment.provider.form.airwallex</field>
+    <record id="view_payment_provider_form_inherit_airwallex" model="ir.ui.view">
+        <field name="name">payment.provider.form.inherit.airwallex</field>
         <field name="model">payment.provider</field>
         <field name="inherit_id" ref="payment.payment_provider_form"/>
         <field name="arch" type="xml">
-            
-            <xpath expr="//group[@name='provider_credentials']" position="inside">
-                <group string="Airwallex Credentials" invisible="code != 'airwallex'">
-                    <field name="airwallex_client_id" required="code == 'airwallex'"/>
-                    <field name="airwallex_api_key" password="True" required="code == 'airwallex'"/>
+            <!-- 在 credentials 组之前添加说明 -->
+            <group name="provider_credentials" position="before">
+                <div class="alert alert-info" role="alert" invisible="code != 'airwallex'">
+                    <strong>Airwallex Setup:</strong> Enter your Client ID and API Key from your Airwallex account.
+                    <a href="https://www.airwallex.com/developers" target="_blank" class="alert-link">Airwallex Developers Portal</a>
+                </div>
+            </group>
+
+            <!-- 在 credentials 组内部添加 Airwallex 专属字段组 -->
+            <group name="provider_credentials" position="inside">
+                <group string="Airwallex Credentials" name="airwallex_credentials" invisible="code != 'airwallex'">
+                    <field name="airwallex_client_id" 
+                           required="code == 'airwallex' and state == 'enabled'"
+                           groups="base.group_system"/>
+                    <field name="airwallex_api_key" 
+                           required="code == 'airwallex' and state == 'enabled'"
+                           password="True" 
+                           groups="base.group_system"/>
+                    <field name="airwallex_webhook_secret" 
+                           password="True" 
+                           groups="base.group_system"/>
                     
-                    <div class="o_row mt-2" invisible="code != 'airwallex'">
+                    <div class="o_row mt-2">
                         <button name="action_airwallex_sync_methods" 
                                 type="object" 
                                 string="Sync Payment Methods" 
@@ -20,8 +36,7 @@
                                 help="從 Airwallex 帳號同步已啟用的支付方式"/>
                     </div>
                 </group>
-            </xpath>
-
+            </group>
         </field>
     </record>
 </odoo>

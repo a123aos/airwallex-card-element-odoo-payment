@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="airwallex_inline_form" inherit_id="payment.inline_form">
+        <xpath expr="//div[@name='o_payment_inline_form_container']" position="replace">
+            <t t-if="provider.code == 'airwallex' and not payment_method.is_redirection">
+                <div t-att-id="'airwallex-container-' + str(provider.id)"
+                     class="o_payment_inline_form"
+                     role="region"
+                     aria-label="Airwallex Drop-in Payment Form">
+                    <div class="text-center">
+                        <i class="fa fa-circle-o-notch fa-spin fa-2x text-primary mb-2"></i>
+                        <p class="mb-0 text-muted">
+                            <strong>載入中...</strong><br/>
+                            <small>請稍候</small>
+                        </p>
+                    </div>
+                </div>
+            </t>
+            <t t-else="">
+                <div name="o_payment_inline_form_container"
+                     t-att-data-payment-method-id="payment_method.id"
+                     t-att-data-provider-id="provider.id"
+                     t-att-data-provider-code="provider.code"
+                     t-att-data-is-redirection="payment_method.is_redirection"
+                     t-attf-class="o_payment_inline_form_container #{'d-none' if active else ''}">
+                    <t t-if="not payment_method.is_redirection">
+                        <t t-call="payment.form"/>
+                    </t>
+                    <t t-if="payment_method.is_redirection">
+                        <button type="button"
+                                class="btn btn-primary o_payment_submit_button"
+                                t-on-click="onSubmit">
+                            <t t-esc="button_label"/>
+                        </button>
+                    </t>
+                </div>
+            </t>
+        </xpath>
+    </template>
+</odoo>
