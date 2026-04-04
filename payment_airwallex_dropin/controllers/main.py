@@ -1,187 +1,121 @@
 # -*- coding: utf-8 -*-
-import logging
+import json
 import hmac
 import hashlib
-from pprint import pformat
-from odoo import http
+import logging
+
+from odoo import http, _
 from odoo.http import request
 
 _logger = logging.getLogger(__name__)
 
 class AirwallexController(http.Controller):
 
-    @http.route('/payment/airwallex/return', type='http', auth='public', methods=['GET', 'POST'], csrf=False, save_session=False)
-    def airwallex_return_from_checkout(self, **data):
-        """處理從 Airwallex 支付頁面跳轉回 Odoo 的請求"""
-        _logger.info("Airwallex: Return from checkout with data:\n%s", pformat(data))
-        
-        # 提取 payment_intent_id
-        intent_id = data.get('payment_intent_id') or data.get('id')
-        
-        if not intent_id:
-            _logger.warning("Airwallex: Return URL accessed without intent ID.")
-            return request.redirect('/payment/status')
+    # -------------------------------------------------------------------------
+    # 1. 前端呼叫：建立或獲取 Payment Intent
+    # -------------------------------------------------------------------------
+    @http.route('/payment/airwallex/create_intent', type='json', auth='public', methods=['POST'], csrf=False)
+    def airwallex_create_intent(self, reference, **kwargs):
+        """
+        JS 呼叫此接口獲取最新 client_secret。
+        適配最新 Model：處理回傳的字典 (Dict) 結構。
+        """
+        try:
+            _logger.info("Airwallex: 收到 Intent 請求 (交易參考: %s)", reference)
+            
+            # 獲取交易記錄 (使用 sudo 確保權限)
+            tx_sudo = request.env['payment.transaction'].sudo().search([
+                ('reference', '=', reference)
+            ], limit=1)
+            
+            if not tx_sudo:
+                _logger.error("Airwallex: 找不到對應的交易記錄 %s", reference)
+                return {'error': _('找不到交易記錄')}
 
-        # 查找交易紀錄
-        tx_sudo = request.env['payment.transaction'].sudo().search([
-            ('airwallex_intent_id', '=', intent_id),
-            ('provider_code', '=', 'airwallex')
+            # 呼叫 Model 層：現在回傳的是 {'intent_id': ..., 'client_secret': ...} 或 {'error': ...}
+            result = tx_sudo._airwallex_create_intent()
+            
+            # 檢查 Model 是否回傳了錯誤訊息
+            if 'error' in result:
+                _logger.error("Airwallex: 交易 %s 初始化失敗 - %s", reference, result['error'])
+                return {'error': result['error']}
+
+            # 成功時回傳給前端 JS
+            return {
+                'intent_id': result['intent_id'],
+                'client_secret': result['client_secret'],
+            }
+
+        except Exception as e:
+            _logger.exception("Airwallex Create Intent 發生未預期異常")
+            return {'error': str(e)}
+
+    # -------------------------------------------------------------------------
+    # 2. Webhook 處理：嚴格簽名驗證 (HMAC-SHA256)
+    # -------------------------------------------------------------------------
+    @http.route('/payment/airwallex/webhook', type='http', auth='public', methods=['POST'], csrf=False)
+    def airwallex_webhook(self):
+        """
+        Airwallex Webhook 進入點。
+        安全性核心：驗證 x-signature 確保請求來自 Airwallex 官方。
+        """
+        # A. 獲取原始 Request Data 與 Header
+        raw_body_bytes = request.httprequest.get_data()
+        raw_body_str = raw_body_bytes.decode('utf-8')
+        timestamp = request.httprequest.headers.get('x-timestamp')
+        received_signature = request.httprequest.headers.get('x-signature')
+
+        # B. 獲取 Webhook Secret
+        provider_sudo = request.env['payment.provider'].sudo().search([
+            ('code', '=', 'airwallex'),
+            ('state', '!=', 'disabled')
         ], limit=1)
+        
+        # 確保後端有設定 Webhook Secret
+        webhook_secret = provider_sudo.airwallex_webhook_secret
 
-        if tx_sudo:
-            # 主动查询 Intent 状态并处理
-            intent_info = tx_sudo.provider_id._airwallex_make_request(
-                f'/pa/payment_intents/{intent_id}', method='GET'
-            )
-            tx_sudo._handle_notification_data('airwallex', intent_info)
-            _logger.info("Airwallex: Return processed for tx %s (status: %s)", 
-                        tx_sudo.reference, intent_info.get('status'))
-        else:
-            _logger.warning("Airwallex: No transaction found for intent %s", intent_id)
-        
-        return request.redirect('/payment/status')
+        if not all([webhook_secret, timestamp, received_signature]):
+            _logger.error("Airwallex Webhook: 缺少必要驗證資訊 (Timestamp/Signature/Secret)")
+            return request.make_response('UNAUTHORIZED', status=401)
 
-    @http.route('/payment/airwallex/webhook', type='jsonrpc', auth='public', methods=['POST'], csrf=False)
-    def airwallex_webhook(self, **data):
-        """處理 Airwallex 异步 Webhook（含签名验证）"""
-        _logger.info("Airwallex Webhook received:\n%s", pformat(data))
-        
-        # ========== 1️⃣ 签名验证 ==========
-        webhook_signature = request.httprequest.headers.get('x-signature')
-        webhook_timestamp = request.httprequest.headers.get('x-timestamp')
-        
-        if not webhook_signature or not webhook_timestamp:
-            _logger.warning("Airwallex Webhook: Missing signature headers (x-signature/x-timestamp).")
-            return {'error': 'Missing signature headers'}
-        
-        # 获取 webhook secret
-        provider = request.env['payment.provider'].sudo().search([
-            ('code', '=', 'airwallex')
-        ], limit=1)
-        
-        if not provider or not provider.airwallex_webhook_secret:
-            _logger.error("Airwallex Webhook: No webhook secret configured in provider settings.")
-            return {'error': 'Server misconfigured - missing webhook secret'}
-        
-        secret = provider.airwallex_webhook_secret
-        raw_body = request.httprequest.get_data(as_text=True)
-        
-        # 按文档计算签名: timestamp + raw_body（无分隔符），hex digest
-        value_to_digest = f"{webhook_timestamp}{raw_body}"
-        expected_sig = hmac.new(
-            secret.encode('utf-8'), 
-            value_to_digest.encode('utf-8'), 
+        # C. 【核心安全性】計算 HMAC-SHA256 簽名
+        # 官方規範：signature = hmac_sha256(webhook_secret, timestamp + raw_body)
+        string_to_sign = timestamp + raw_body_str
+        expected_signature = hmac.new(
+            webhook_secret.encode('utf-8'),
+            string_to_sign.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
-        
-        # 恒定时间比较
-        if not hmac.compare_digest(expected_sig, webhook_signature):
-            # ✅ 安全警告：不记录签名值，仅记录验证失败
-            _logger.warning(
-                "Airwallex Webhook: Signature verification failed. "
-                "Possible causes: wrong webhook secret, payload tampered, or replayed request."
-            )
-            return {'error': 'Invalid signature'}
-        
-        _logger.info("Airwallex Webhook: Signature verified successfully.")
-        
-        # ========== 2️⃣ 解析事件（✅ 根据文档结构获取）==========
-        event_type = data.get('name')  # 文档使用 'name' 字段
-        resource = data.get('data', {}).get('object', {})  # 文档：resource 在 data.object 下
-        
-        if not event_type:
-            _logger.warning("Airwallex Webhook: Missing 'name' field in payload.")
-            return {'error': 'Missing event name'}
-        
-        if not resource:
-            _logger.warning("Airwallex Webhook: Missing resource object in data.object.")
-            return {'error': 'Missing resource object'}
-        
-        _logger.debug("Airwallex Webhook: Event type: %s, Resource ID: %s", 
-                     event_type, resource.get('id'))
-        
-        # ========== 3️⃣ 根据事件类型查找交易 ==========
-        tx = None
-        if event_type.startswith('payment_intent.'):
-            # 支付事件：使用 payment_intent_id 查找
-            intent_id = resource.get('id')
-            if intent_id:
-                tx = request.env['payment.transaction'].sudo().search([
-                    ('airwallex_intent_id', '=', intent_id),
-                    ('provider_code', '=', 'airwallex')
-                ], limit=1)
-        elif event_type.startswith('refund.'):
-            # 退款事件：使用 refund_id 查找
-            refund_id = resource.get('id')
-            if refund_id:
-                tx = request.env['payment.transaction'].sudo().search([
-                    ('airwallex_refund_id', '=', refund_id),
-                    ('provider_code', '=', 'airwallex')
-                ], limit=1)
-        
-        if not tx:
-            _logger.warning("Airwallex Webhook: No transaction found for event %s (resource ID: %s)", 
-                          event_type, resource.get('id'))
-            # 注意：某些事件（如refund.received）可能在tx记录前到达，不应返回错误
-            if event_type.startswith('refund.') and event_type != 'refund.failed':
-                _logger.info("Airwallex Webhook: Refund event for unknown refund ID %s - may be normal", 
-                           refund_id)
-                return {'status': 'ok'}  # 忽略未知退款事件
-            return {'error': 'Transaction not found'}
-        
-        _logger.info("Airwallex Webhook: Found transaction %s for event %s", 
-                    tx.reference, event_type)
-        
-        # ========== 4️⃣ 事件处理 ==========
+
+        # D. 安全比較簽名 (防範計時攻擊)
+        if not hmac.compare_digest(expected_signature, received_signature):
+            _logger.warning("Airwallex Webhook: 簽名驗證失敗！")
+            return request.make_response('INVALID_SIGNATURE', status=401)
+
+        # E. 解析資料並同步至 Model
         try:
-            # --- PaymentIntent 事件 ---
-            if event_type == 'payment_intent.succeeded':
-                tx._set_done()
-                _logger.info("Airwallex Webhook: Payment succeeded → tx %s set to 'done'", 
-                            tx.reference)
-            elif event_type == 'payment_intent.cancelled':
-                tx._set_canceled()
-                _logger.info("Airwallex Webhook: Payment cancelled → tx %s set to 'cancelled'", 
-                            tx.reference)
-            elif event_type in (
-                'payment_intent.requires_customer_action',
-                'payment_intent.requires_capture',
-                'payment_intent.pending',
-                'payment_intent.pending_review'
-            ):
-                tx._set_pending()
-                _logger.info("Airwallex Webhook: Payment pending (event: %s) → tx %s set to 'pending'", 
-                            event_type, tx.reference)
-            elif event_type == 'payment_intent.requires_payment_method':
-                tx._set_error(_("Payment requires a new payment method."))
-                _logger.info("Airwallex Webhook: Requires payment method → tx %s set to 'error'", 
-                            tx.reference)
-            elif event_type in ('payment_intent.created', 'payment_intent.updated'):
-                # 仅记录，不改变状态
-                _logger.info("Airwallex Webhook: %s for tx %s (status unchanged)", 
-                            event_type, tx.reference)
-            
-            # --- Refund 事件 ---
-            elif event_type == 'refund.accepted':
-                tx._set_done()
-                _logger.info("Airwallex Webhook: Refund accepted → tx %s (refund: %s) set to 'done'", 
-                            tx.reference, resource.get('id'))
-            elif event_type == 'refund.failed':
-                failure_reason = resource.get('failure_reason', 'Unknown reason')
-                tx._set_error(_("Refund failed: %s", failure_reason))
-                _logger.warning("Airwallex Webhook: Refund failed → tx %s set to 'error' (reason: %s)", 
-                              tx.reference, failure_reason)
-            elif event_type in ('refund.received', 'refund.settled'):
-                # 记录但不改变交易状态
-                _logger.info("Airwallex Webhook: %s for refund %s (tx %s status unchanged)", 
-                            event_type, resource.get('id'), tx.reference)
+            notification = json.loads(raw_body_str)
+            event_type = notification.get('name')
+            # 取得核心數據物件 (PaymentIntent Object)
+            payload = notification.get('data', {}).get('object', {})
+            intent_id = payload.get('id')
+
+            _logger.info("Airwallex Webhook 驗證通過: %s (Intent: %s)", event_type, intent_id)
+
+            # 透過 Model 層的搜尋邏輯定位 Transaction
+            tx_sudo = request.env['payment.transaction'].sudo()._get_tx_from_notification_data(
+                'airwallex', payload
+            )
+
+            if tx_sudo:
+                # 更新訂單狀態機
+                tx_sudo._handle_notification_data('airwallex', payload)
+                _logger.info("Airwallex Webhook: 交易 %s 狀態已更新", tx_sudo.reference)
             else:
-                _logger.warning("Airwallex Webhook: Unhandled event type: %s (tx: %s)", 
-                              event_type, tx.reference)
-        
+                _logger.warning("Airwallex Webhook: 無法匹配交易 (Intent ID: %s)", intent_id)
+
+            return request.make_response('OK', status=200)
+
         except Exception as e:
-            _logger.exception("Airwallex Webhook: Error processing event %s for tx %s: %s", 
-                            event_type, tx.reference if tx else 'unknown', str(e))
-            return {'error': 'Processing error'}
-        
-        return {'status': 'ok'}
+            _logger.error("Airwallex Webhook 處理異常: %s", str(e))
+            return request.make_response('INTERNAL_SERVER_ERROR', status=500)

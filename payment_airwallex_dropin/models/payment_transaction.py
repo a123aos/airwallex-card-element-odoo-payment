@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import logging
+import uuid
 from odoo import api, fields, models, _
+from odoo.http import request
 from odoo.exceptions import ValidationError
 
 _logger = logging.getLogger(__name__)
@@ -8,118 +10,90 @@ _logger = logging.getLogger(__name__)
 class PaymentTransaction(models.Model):
     _inherit = 'payment.transaction'
 
-    # Airwallex 特定字段
-    airwallex_intent_id = fields.Char(string="Airwallex Intent ID", readonly=True)
-    airwallex_refund_id = fields.Char(string="Airwallex Refund ID", readonly=True)
+    airwallex_intent_id = fields.Char(string="Airwallex Intent ID", readonly=True, index=True)
+    airwallex_client_secret = fields.Char(string="Airwallex Client Secret", readonly=True)
+    airwallex_intent_at = fields.Datetime(string="Intent Created At", readonly=True)
 
-    def _get_specific_processing_values(self, processing_values):
-        """从渲染值中存储 intent_id"""
-        res = super()._get_specific_processing_values(processing_values)
-        if self.provider_code != 'airwallex':
-            return res
-        self.airwallex_intent_id = processing_values.get('airwallex_intent_id')
-        return res
+    def _airwallex_create_intent(self):
+        """ 建立或刷新 Airwallex Payment Intent (具備冪等性) """
+        self.ensure_one()
+        now = fields.Datetime.now()
+        
+        # 1. 檢查有效期 (50分鐘緩衝)
+        if self.airwallex_intent_id and self.airwallex_intent_at:
+            if (now - self.airwallex_intent_at).total_seconds() < 3000:
+                return {
+                    'intent_id': self.airwallex_intent_id,
+                    'client_secret': self.airwallex_client_secret,
+                }
+
+        # 2. 生成確定的 UUID 作為 request_id，確保重試時不會產生重複 Intent
+        # 格式：odoo-{database_name}-{transaction_id}
+        namespace_str = f"odoo-{self.env.cr.dbname}-{self.id}"
+        deterministic_request_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, namespace_str))
+
+        # 3. 準備 Payload (補回 return_url)
+        base_url = self.provider_id.get_base_url()
+        payload = {
+            'request_id': deterministic_request_id,
+            'amount': self.amount,
+            'currency': self.currency_id.name,
+            'merchant_order_id': self.reference,
+            'return_url': f"{base_url}/payment/status", # 支付完成後的重定向網址
+        }
+
+        try:
+            data = self.provider_id._make_airwallex_request('/pa/payment_intents/create', payload=payload, method='POST')
+            
+            if not data or 'id' not in data:
+                _logger.error("Airwallex API 回傳異常: %s", data)
+                return {'error': 'Invalid API response'}
+
+            self.write({
+                'airwallex_intent_id': data['id'],
+                'airwallex_client_secret': data['client_secret'],
+                'airwallex_intent_at': now,
+            })
+            
+            return {
+                'intent_id': data['id'],
+                'client_secret': data['client_secret'],
+            }
+        except Exception as e:
+            _logger.exception("Airwallex Intent 建立失敗")
+            return {'error': str(e)}
+
+    # ====================== Webhook 處理邏輯 ======================
 
     def _get_tx_from_notification_data(self, provider_code, notification_data):
-        """通过 intent_id 查找交易（Webhook 场景）"""
+        """ 根據 Webhook 傳來的 Intent ID 尋找交易紀錄 """
         tx = super()._get_tx_from_notification_data(provider_code, notification_data)
         if provider_code != 'airwallex' or len(tx) == 1:
             return tx
-
-        # 尝试从 notification_data 获取 intent_id（兼容不同事件结构）
-        intent_id = notification_data.get('airwallex_intent_id')
-        if not intent_id:
-            # 备用：从 webhook 标准结构 data.object.id 提取
-            intent_id = notification_data.get('data', {}).get('object', {}).get('id')
         
+        # Controller 應確保傳入的是 data.object
+        intent_id = notification_data.get('id')
         if not intent_id:
-            raise ValidationError(_("Airwallex: No intent ID found in notification data."))
-        
-        tx = self.search([
-            ('airwallex_intent_id', '=', intent_id),
-            ('provider_code', '=', 'airwallex')
-        ], limit=1)
-        if not tx:
-            raise ValidationError(_("Airwallex: No transaction found for Intent ID %s.", intent_id))
-        return tx
+            return tx
+            
+        return self.search([('airwallex_intent_id', '=', intent_id), ('provider_code', '=', 'airwallex')], limit=1)
 
     def _handle_notification_data(self, provider_code, notification_data):
-        """处理 Airwallex 的支付通知（用于 Return URL 场景）"""
+        """ 根據 Airwallex 狀態機更新 Odoo 訂單狀態 """
         tx = super()._handle_notification_data(provider_code, notification_data)
-        if provider_code != 'airwallex':
+        if provider_code != 'airwallex' or tx.state in ['done', 'cancel']:
             return tx
 
-        # ✅ 获取状态（API 返回值为大写，如 'SUCCEEDED'）
-        if 'status' in notification_data:
-            intent_info = notification_data
-        else:
-            # 理论上不应发生：控制器应已传递完整 intent_info
-            intent_info = self.provider_id._airwallex_make_request(
-                f'/pa/payment_intents/{self.airwallex_intent_id}', 
-                method='GET'
-            )
-        
-        status = intent_info.get('status', '')  # ✅ 保持原始大写格式
+        status = notification_data.get('status')
+        _logger.info("處理 Airwallex Webhook: TX %s, Status %s", tx.reference, status)
 
-        # ✅ 状态映射（按 Airwallex 文档使用大写值）
         if status == 'SUCCEEDED':
             tx._set_done()
-            _logger.info("Airwallex: Transaction %s set to 'done' (status: %s)", tx.reference, status)
-        elif status in ['REQUIRES_CAPTURE', 'REQUIRES_CUSTOMER_ACTION', 'PENDING', 'PENDING_REVIEW']:
+        elif status == 'REQUIRES_CAPTURE':
+            tx._set_authorized()
+        elif status in ['PENDING', 'PENDING_REVIEW']:
             tx._set_pending()
-            _logger.info("Airwallex: Transaction %s set to 'pending' (status: %s)", tx.reference, status)
-        elif status in ['CANCELLED', 'EXPIRED']:
+        elif status in ['FAILED', 'CANCELLED']:
             tx._set_canceled()
-            _logger.info("Airwallex: Transaction %s set to 'canceled' (status: %s)", tx.reference, status)
-        elif status == 'REQUIRES_PAYMENT_METHOD':
-            tx._set_error(_("Payment requires a new payment method."))
-            _logger.warning("Airwallex: Transaction %s set to 'error' (requires_payment_method)", tx.reference)
-        else:
-            # 未知状态，保持 pending 并记录警告
-            _logger.warning("Airwallex: Unknown status '%s' for transaction %s - keeping 'pending'", status, tx.reference)
-            tx._set_pending()
-
-        return tx
-
-    def _send_refund_request(self, amount_to_refund=None):
-        """发起 Airwallex 退款（使用 /pa/refunds/create）"""
-        if self.provider_code != 'airwallex':
-            return super()._send_refund_request(amount_to_refund=amount_to_refund)
-
-        # 生成唯一的退款请求 ID
-        refund_ref = f"REFUND-{self.reference}-{fields.Datetime.now().strftime('%y%m%d%H%M%S')}"
-        refund_amount = amount_to_refund or self.amount
-
-        payload = {
-            'request_id': refund_ref,
-            'payment_intent_id': self.airwallex_intent_id,
-            'amount': refund_amount,  # ✅ 浮点数（如 10.50）
-            'reason': 'requested_by_customer',  # ✅ 可选，最长 128 字符
-        }
-
-        _logger.info("Airwallex: Initiating refund for tx %s, payload: %s", self.reference, payload)
         
-        try:
-            refund_data = self.provider_id._airwallex_make_request(
-                '/pa/refunds/create',
-                payload=payload,
-                method='POST'
-            )
-        except Exception as e:
-            _logger.error("Airwallex: Refund API call failed for tx %s: %s", self.reference, str(e))
-            raise ValidationError(_("Failed to initiate refund: %s") % str(e))
-
-        if 'error' in refund_data:
-            error_msg = refund_data['error'].get('message', 'Unknown error') if isinstance(refund_data['error'], dict) else str(refund_data['error'])
-            _logger.error("Airwallex: Refund API error for tx %s: %s", self.reference, error_msg)
-            raise ValidationError(_("Airwallex Refund Error: %s") % error_msg)
-
-        refund_id = refund_data.get('id')
-        if refund_id:
-            self.airwallex_refund_id = refund_id
-            _logger.info("Airwallex: Refund created with ID %s for tx %s", refund_id, self.reference)
-        else:
-            _logger.warning("Airwallex: Refund response missing 'id' field: %s", refund_data)
-
-        self._set_pending()  # ✅ 退款请求后设为 pending（等待 webhook 确认）
-        return self
+        return tx
