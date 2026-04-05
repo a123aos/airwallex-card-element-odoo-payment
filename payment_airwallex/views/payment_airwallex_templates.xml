@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="airwallex_inline_form">
+        <div t-att-data-provider-id="provider_id" 
+             t-att-data-provider-code="'airwallex'"
+             class="o_airwallex_inline_form">
+            
+            <div id="airwallex-card-element" style="min-height: 40px; margin: 10px 0;"></div>
+            
+            <div id="airwallex-error-message" class="text-danger small mt-2" role="alert"></div>
+        </div>
+    </template>
+</odoo>
