@@ -1,25 +1,21 @@
 /** @odoo-module **/
 
 import { _t } from '@web/core/l10n/translation';
-import { registry } from '@web/core/registry';
 import { PaymentForm } from '@payment/interactions/payment_form';
+import { patch } from '@web/core/utils/patch';
 
-/**
- * Airwallex 專用的支付表單互動邏輯
- * 繼承自 Odoo 19 原生 PaymentForm Interaction
- */
-export class AirwallexPaymentForm extends PaymentForm {
-    
+patch(PaymentForm.prototype, {
+
     setup() {
         super.setup();
         this.airwallexLoaded = false;
-        this.cardElement = null;
-    }
+        this.airwallexCardElement = null;
+    },
 
-    // #=== OVERRIDES ===#
+    // #=== DOM 準備階段 ===#
 
     /**
-     * 準備 Inline Form：初始化 SDK 並掛載 Iframe
+     * 當用戶在前端選擇 Airwallex 支付選項時觸發
      * @override
      */
     async _prepareInlineForm(providerId, providerCode, paymentOptionId, paymentMethodCode, flow) {
@@ -27,47 +23,60 @@ export class AirwallexPaymentForm extends PaymentForm {
             return super._prepareInlineForm(...arguments);
         }
 
-        // 強制設定為 Direct 模式，確保觸發 _processDirectFlow
+        // 強制設置為直連流，確保 Odoo 不會嘗試跳轉到外部支付頁
         this._setPaymentFlow('direct');
 
-        // 1. 確保 Airwallex SDK 已載入
-        if (!this.airwallexLoaded) {
-            await this._loadAirwallexSDK();
-            
-            // 初始化 SDK
-            const env = this.paymentContext.providerState === 'enabled' ? 'prod' : 'demo';
-            Airwallex.init({
-                env: env,
-                enabledElements: ['payments'],
-            });
-            this.airwallexLoaded = true;
-        }
+        try {
+            // 1. 等待並獲取正確的 SDK 全域變數
+            const sdk = await this._getAirwallexSDK();
 
-        // 2. 建立並掛載 Card Element
-        if (!this.cardElement) {
-            this.cardElement = Airwallex.createElement('card', {
-                style: {
-                    base: {
-                        fontSize: '16px',
-                        color: '#32325d',
-                        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-                        '::placeholder': { color: '#aab7c4' },
+            // 2. 初始化 SDK (只執行一次)
+            if (!this.airwallexLoaded) {
+                const env = this.paymentContext.providerState === 'enabled' ? 'prod' : 'demo';
+                await sdk.init({
+                    env: env,
+                    enabledElements: ['payments'],
+                });
+                this.airwallexLoaded = true;
+            }
+
+            // 3. 建立並掛載 Card Element (注意 await)
+            const container = document.getElementById('airwallex-card-element');
+            if (container && !this.airwallexCardElement) {
+                this.airwallexCardElement = await sdk.createElement('card', {
+                    style: {
+                        base: {
+                            fontSize: '16px',
+                            color: '#32325d',
+                            '::placeholder': { color: '#aab7c4' },
+                        },
                     },
-                    invalid: {
-                        color: '#fa755a',
-                        iconColor: '#fa755a',
-                    },
-                },
-            });
-            
-            // 掛載至 div#airwallex-card-element
-            this.cardElement.mount('airwallex-card-element');
+                });
+
+                if (!this.airwallexCardElement) {
+                    throw new Error(_t("Failed to create Airwallex Card Element."));
+                }
+
+                // 掛載到 XML 中定義的 ID 容器
+                this.airwallexCardElement.mount('airwallex-card-element');
+
+                // 監聽 SDK 內部錯誤 (如卡號無效)
+                container.addEventListener('onError', (event) => {
+                    const { error } = event.detail;
+                    this._displayErrorDialog(_t("Card Error"), error.message);
+                    this._enableButton(); // 恢復支付按鈕
+                });
+            }
+        } catch (err) {
+            this._displayErrorDialog(_t("Technical Error"), err.message);
+            this._enableButton();
         }
-    }
+    },
+
+    // #=== 支付執行階段 ===#
 
     /**
-     * 執行 Direct 支付確認
-     * 當用戶點擊「立即付款」且 Odoo 成功建立後端 Transaction 後觸發
+     * 當用戶點擊 Odoo 的「立即支付」按鈕時觸發
      * @override
      */
     async _processDirectFlow(providerCode, paymentOptionId, paymentMethodCode, processingValues) {
@@ -75,78 +84,75 @@ export class AirwallexPaymentForm extends PaymentForm {
             return super._processDirectFlow(...arguments);
         }
 
-        // --- 開始處理支付 UI ---
-        this._disableButton(); // 禁用按鈕（Odoo 內建方法）
-        const payButton = document.querySelector('button[name="o_payment_submit_button"]');
-        if (payButton) {
-            // 將按鈕改為轉圈圈狀態
-            payButton.innerHTML = '<i class="fa fa-refresh fa-spin me-2"></i>' + _t("Processing...");
+        // 從後端傳回的 processingValues 中提取必要密鑰
+        const intentId = processingValues['intent_id'] || processingValues['airwallex_intent_id'];
+        const clientSecret = processingValues['client_secret'] || processingValues['airwallex_client_secret'];
+        const autoCapture = processingValues['airwallex_auto_capture'] !== undefined ? processingValues['airwallex_auto_capture'] : true;
+
+        if (!intentId || !clientSecret || !this.airwallexCardElement) {
+            this._displayErrorDialog(_t("Error"), _t("Payment element not initialized correctly."));
+            this._enableButton();
+            return;
         }
 
         try {
-            const intentId = processingValues['airwallex_intent_id'];
-            const clientSecret = processingValues['airwallex_client_secret'];
-
-            if (!intentId || !clientSecret) {
-                throw new Error(_t("Missing Airwallex configuration (Intent ID or Client Secret)."));
-            }
-
-            // 呼叫 Card Element 的 confirm 方法
-            const result = await this.cardElement.confirm({
+            // 調用 Airwallex 確認支付 (這會自動處理 3DS 驗證彈窗)
+            const result = await this.airwallexCardElement.confirm({
                 intent_id: intentId,
                 client_secret: clientSecret,
+                payment_method_options: {
+                    card: { auto_capture: autoCapture }
+                }
             });
 
-            // 檢查結果狀態
-            if (result && (result.status === 'SUCCEEDED' || result.status === 'CAPTURED')) {
-                // 成功：導向至結果頁面
-                window.location = this.paymentContext['landingRoute'] || '/payment/status';
-            } else if (result && result.error) {
-                // 支付被拒絕或發生錯誤
-                this._displayErrorDialog(_t("Payment Failed"), result.error.message);
-                this._resetPayButton(payButton);
-            } else {
-                // 其他非預期狀態 (如使用者取消)
-                console.warn("Airwallex status:", result?.status);
-                this._resetPayButton(payButton);
-            }
+            // 使用 Odoo 標準方式處理跳轉
+            this._handleAirwallexResult(result);
+
         } catch (err) {
-            // 技術性錯誤（如網路斷線、SDK 崩潰）
             this._displayErrorDialog(_t("Technical Error"), err.message);
-            this._resetPayButton(payButton);
+            this._enableButton();
         }
-    }
+    },
 
-    // #=== HELPERS ===#
+    // #=== 私有輔助方法 ===#
 
     /**
-     * 輔助方法：將按鈕恢復為原始狀態
+     * 處理支付結果並執行 Odoo 跳轉
+     * @private
      */
-    _resetPayButton(btn) {
-        if (btn) {
-            // 恢復原本的按鈕內容 (請根據你 XML 裡的文字設定，通常是 Pay Now)
-            btn.innerHTML = _t("Pay Now");
+    _handleAirwallexResult(result) {
+        // 定義 Airwallex 視為成功的狀態碼
+        const successStatuses = ['SUCCEEDED', 'CAPTURED', 'AUTHORIZED', 'REQUIRES_CAPTURE', 'PENDING'];
+
+        if (result && successStatuses.includes(result.status)) {
+            // ✅ 關鍵：跳轉到 Odoo 的標準狀態頁面，觸發後端訂單確認
+            window.location = '/payment/status';
+        } else if (result && result.error) {
+            this._displayErrorDialog(_t("Payment Failed"), result.error.message);
+            this._enableButton();
+        } else {
+            // 其他未知情況，恢復按鈕讓用戶重試
+            this._enableButton();
         }
-        this._enableButton(); // 重新啟用按鈕（Odoo 內建方法）
-    }
+    },
 
     /**
-     * 動態載入 Airwallex 最新官方 Bundle
+     * 獲取 Airwallex SDK，處理變數名稱與載入時序
      */
-    _loadAirwallexSDK() {
+    async _getAirwallexSDK(timeout = 5000) {
+        const start = Date.now();
         return new Promise((resolve, reject) => {
-            if (window.Airwallex) return resolve();
-            const script = document.createElement('script');
-            script.src = "https://checkout.airwallex.com/assets/elements.bundle.min.js";
-            script.async = true;
-            script.onload = resolve;
-            script.onerror = () => reject(new Error(_t("Failed to load Airwallex SDK.")));
-            document.head.appendChild(script);
+            const check = () => {
+                const sdk = window.AirwallexComponentsSDK || window.Airwallex;
+                if (sdk && typeof sdk.init === 'function') {
+                    resolve(sdk);
+                } else if (Date.now() - start > timeout) {
+                    reject(new Error(_t("Airwallex SDK loading timeout.")));
+                } else {
+                    setTimeout(check, 100);
+                }
+            };
+            check();
         });
-    }
-}
-
-/**
- * 使用 force: true 強制覆蓋原生的 PaymentForm Interaction
- */
-registry.category('public.interactions').add('payment.payment_form', AirwallexPaymentForm, { force: true });
+    },
+});
